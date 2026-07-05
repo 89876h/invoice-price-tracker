@@ -15,21 +15,10 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-def clean_price_string(price_str):
-    """Cleans up fragmented price segments from split columns."""
-    cleaned = re.sub(r"[^\d.]", "", price_str.strip())
-    try:
-        val = float(cleaned)
-        if 0.01 <= val <= 100000.00:
-            return val
-    except ValueError:
-        pass
-    return None
-
 def parse_invoice_content(text_content, filename):
     """
-    Robust line-by-line parser tailored for complex multi-column layouts.
-    Extracts explicit material descriptions and unit rates.
+    Scans invoice text line by line using specific patterns to find item lines.
+    Extracts the clean material description and its unit price.
     """
     items = {}
     lines = text_content.split('\n')
@@ -42,52 +31,56 @@ def parse_invoice_content(text_content, filename):
         if not cleaned_line:
             continue
             
-        # Ignore obvious headers, metadata, and totals
-        if any(x in cleaned_line.lower() for x in ["sub total:", "total:", "tax:", "remit to:", "ship to:", "sold to:", "page:"]):
+        # Skip summary totals or layout noise
+        if any(x in cleaned_line.lower() for x in ["sub total:", "total:", "tax:", "remit to:", "ship to:", "sold to:", "visa credit:"]):
             continue
 
-        # Handle pipe-separated layouts (like Elliott Electric)
-        if '|' in cleaned_line:
-            parts = [p.strip() for p in cleaned_line.split('|')]
+        # Look for typical item lines containing numbers and material keywords
+        # Example: '1 | 60 | 0 PVC1 | PVC | SCH 40 1" 10' PVC CONDUIT | $ 40.88 C'
+        # Example: '15 | 8 | 0 CPL1 | PVF | 1" PVC COUPLING | C 35.00 $'
+        if any(keyword in cleaned_line.upper() for keyword in ["CONDUIT", "ELBOW", "COUPLING", "STRAP", "CAP", "PVC", "PVF", "BRI"]):
             
-            # Find the segment containing descriptions (typically long string blocks)
-            desc_part = ""
-            for p in parts:
-                if any(m in p.upper() for m in ["PVC", "CONDUIT", "ELBOW", "COUPLING", "STRAP", "CAP", "BOX", "WIRE"]):
-                    desc_part = p
+            # 1. Clean out the pipe characters to look at the whole string
+            segments = [s.strip() for s in cleaned_line.split('|') if s.strip()]
+            
+            # Find the segment that represents the description text
+            desc = ""
+            for seg in segments:
+                if any(k in seg.upper() for k in ["CONDUIT", "ELBOW", "COUPLING", "STRAP", "CAP"]):
+                    desc = seg
                     break
             
-            if desc_part:
-                # Look for a valid decimal rate within the adjacent columns
-                for p in parts:
-                    # Clean out noise characters to check for standalone numbers
-                    digits_only = re.sub(r"[^\d.]", "", p)
-                    if digits_only and '.' in digits_only:
-                        price = clean_price_string(p)
-                        if price is not None:
-                            # Avoid misidentifying the long Extended Price at the far right
-                            # Unit prices typically map to smaller amounts before totals
-                            items[desc_part] = price
-                            break
-            continue
+            if desc:
+                # 2. Look for the decimal price near the description inside the line segments
+                price = None
+                for seg in segments:
+                    # Find numbers with a decimal point (e.g., 40.88, 35.00, 1258.94)
+                    matches = re.findall(r"\d{1,4}\.\d{2}", seg)
+                    if matches:
+                        try:
+                            # Use the first valid decimal match in the segment
+                            test_price = float(matches[0])
+                            # Filter out extended totals or quantities if they leak in
+                            if 0.01 <= test_price <= 50000.00:
+                                price = test_price
+                        except ValueError:
+                            continue
+                
+                if price is not None:
+                    items[desc] = price
+                    continue
 
-        # Fallback for standard comma-separated lines (CSV/TXT)
+        # Fallback for plain CSV/TXT formats
         if ',' in cleaned_line:
             parts = cleaned_line.split(',')
             if len(parts) >= 2:
                 desc = parts[0].strip()
-                price = clean_price_string(parts[1])
-                if desc and price:
-                    items[desc] = price
-                    continue
-
-        # Fallback regex for standard text line structures
-        match = re.search(r"(.+?)\s+(\d+[\.,]\d{2})\s*$", cleaned_line)
-        if match:
-            desc = match.group(1).strip()
-            price = clean_price_string(match.group(2))
-            if desc and price and len(desc) > 3:
-                items[desc] = price
+                try:
+                    price_val = float(re.sub(r"[^\d.]", "", parts[1]))
+                    if desc and price_val:
+                        items[desc] = price_val
+                except ValueError:
+                    pass
 
     return column_header, items
 
@@ -102,9 +95,9 @@ if uploaded_files:
             try:
                 bytes_data = file.read()
                 
-                # Extract text reliably from either PDF or text files
                 if file.name.lower().endswith('.pdf'):
                     with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
+                        # Extract clean plain layout text from all pages
                         string_data = "\n".join([page.extract_text() or "" for page in pdf.pages])
                 else:
                     string_data = bytes_data.decode("utf-8", errors="ignore")
@@ -123,7 +116,7 @@ if uploaded_files:
                 st.error(f"Error parsing file {file.name}: {str(e)}")
                 continue
         
-        # Format the matrix data into clean row-by-row outputs
+        # Structure parsed keys into rows
         matrix_records = []
         for item_desc, tracking_cols in master_matrix.items():
             record = {"Item Description": item_desc}
@@ -150,7 +143,7 @@ if uploaded_files:
 
             st.session_state["comparison_matrix"] = final_df
         else:
-            st.error("No valid material lines or unit price structures could be parsed. Check text layouts.")
+            st.error("No valid material lines could be compiled. Please check formatting rules.")
 
 if "comparison_matrix" in st.session_state:
     df_to_show = st.session_state["comparison_matrix"]
@@ -167,7 +160,7 @@ if "comparison_matrix" in st.session_state:
         for col in worksheet.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)
             col_letter = col[0].column_letter
-            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 16)
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 20)
             
     st.download_button(
         label="📥 Download Clean Comparison Excel Sheet (.xlsx)",
