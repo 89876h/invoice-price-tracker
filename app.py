@@ -9,7 +9,7 @@ DB_FILE = "material_price_database.csv"
 if os.path.exists(DB_FILE):
     db_df = pd.read_csv(DB_FILE)
 else:
-    db_df = pd.DataFrame(columns=["Date", "File Source", "Item Description", "Unit Price", "Vendor", "Price Change Comment"])
+    db_df = pd.DataFrame(columns=["Date Processed", "Invoice Date", "Invoice Reference / File", "Item Description", "Unit Price", "Vendor", "Price Change Comment"])
 
 st.set_page_config(layout="wide") 
 st.title("🏗️ Bulk Material Price Tracker & Reporter")
@@ -37,6 +37,7 @@ if uploaded_files:
             simulated_vendor = "Apex Material Supplies"
             simulated_item = f"Material Item Type {index % 6}" # Simulates recurring items
             simulated_price = 15.00 + (index * 0.75 % 5.00)     # Simulates price changes
+            simulated_invoice_date = datetime.now().strftime("%Y-%m-%d") # Simulates invoice document date
             # -------------------------------------
 
             # Database Comparison
@@ -58,8 +59,9 @@ if uploaded_files:
                 comment = "🆕 New item added"
 
             new_records.append({
-                "Date": current_date,
-                "File Source": file.name,
+                "Date Processed": current_date,
+                "Invoice Date": simulated_invoice_date,
+                "Invoice Reference / File": file.name,
                 "Item Description": simulated_item,
                 "Unit Price": simulated_price,
                 "Vendor": simulated_vendor,
@@ -89,12 +91,12 @@ if not db_df.empty:
         return ''
 
     with tab1:
-        st.dataframe(db_df.style.applymap(highlight_rows, subset=['Price Change Comment']), use_container_width=True)
+        st.dataframe(db_df.style.map(highlight_rows, subset=['Price Change Comment']), use_container_width=True)
         
     with tab2:
         filtered_df = db_df[db_df["Price Change Comment"].str.contains("⚠️|✅", na=False)]
         if not filtered_df.empty:
-            st.dataframe(filtered_df.style.applymap(highlight_rows, subset=['Price Change Comment']), use_container_width=True)
+            st.dataframe(filtered_df.style.map(highlight_rows, subset=['Price Change Comment']), use_container_width=True)
         else:
             st.info("No items with price updates found yet.")
 
