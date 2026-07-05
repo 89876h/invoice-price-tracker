@@ -15,60 +15,81 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-def clean_price(val):
-    """Safely extracts a valid decimal unit price and filters out non-price numbers."""
-    if pd.isna(val) or val is None:
-        return None
-    cleaned = re.sub(r"[^\d.]", "", str(val).strip())
-    if not cleaned or cleaned.count('.') > 1:
-        return None
+def clean_price_string(price_str):
+    """Cleans up fragmented price segments from split columns."""
+    cleaned = re.sub(r"[^\d.]", "", price_str.strip())
     try:
-        price = float(cleaned)
-        # Filter out random large numbers like phone numbers or tracking IDs
-        if 0.05 <= price <= 50000.00:
-            return price
+        val = float(cleaned)
+        if 0.01 <= val <= 100000.00:
+            return val
     except ValueError:
         pass
     return None
 
-def parse_pdf_tables(file_bytes):
-    """Extracts structured table rows directly using pdfplumber."""
-    extracted_items = {}
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    # Filter out empty rows or headers
-                    if not row or len(row) < 2:
-                        continue
-                    
-                    # Clean up descriptions and filter out short layout artifacts
-                    desc = str(row[0]).strip() if row[0] else ""
-                    if len(desc) < 4 or any(x in desc.lower() for x in ["total", "subtotal", "invoice", "date", "phone", "fax", "ship to", "bill to", "visa", "page"]):
-                        continue
-                        
-                    # Search remaining columns to find a realistic unit price rate
-                    for cell in row[1:]:
-                        price = clean_price(cell)
-                        if price is not None:
-                            extracted_items[desc] = price
-                            break # Found the rate column for this row
-                            
-    return extracted_items
-
-def parse_text_lines(file_content):
-    """Fallback parser for standard CSV or TXT rows."""
+def parse_invoice_content(text_content, filename):
+    """
+    Robust line-by-line parser tailored for complex multi-column layouts.
+    Extracts explicit material descriptions and unit rates.
+    """
     items = {}
-    for line in file_content.split('\n'):
-        if ',' in line:
-            parts = line.split(',')
+    lines = text_content.split('\n')
+    
+    inv_name = filename.split('.')[0]
+    column_header = f"{inv_name} (Rate)"
+    
+    for line in lines:
+        cleaned_line = line.strip()
+        if not cleaned_line:
+            continue
+            
+        # Ignore obvious headers, metadata, and totals
+        if any(x in cleaned_line.lower() for x in ["sub total:", "total:", "tax:", "remit to:", "ship to:", "sold to:", "page:"]):
+            continue
+
+        # Handle pipe-separated layouts (like Elliott Electric)
+        if '|' in cleaned_line:
+            parts = [p.strip() for p in cleaned_line.split('|')]
+            
+            # Find the segment containing descriptions (typically long string blocks)
+            desc_part = ""
+            for p in parts:
+                if any(m in p.upper() for m in ["PVC", "CONDUIT", "ELBOW", "COUPLING", "STRAP", "CAP", "BOX", "WIRE"]):
+                    desc_part = p
+                    break
+            
+            if desc_part:
+                # Look for a valid decimal rate within the adjacent columns
+                for p in parts:
+                    # Clean out noise characters to check for standalone numbers
+                    digits_only = re.sub(r"[^\d.]", "", p)
+                    if digits_only and '.' in digits_only:
+                        price = clean_price_string(p)
+                        if price is not None:
+                            # Avoid misidentifying the long Extended Price at the far right
+                            # Unit prices typically map to smaller amounts before totals
+                            items[desc_part] = price
+                            break
+            continue
+
+        # Fallback for standard comma-separated lines (CSV/TXT)
+        if ',' in cleaned_line:
+            parts = cleaned_line.split(',')
             if len(parts) >= 2:
                 desc = parts[0].strip()
-                price = clean_price(parts[1])
+                price = clean_price_string(parts[1])
                 if desc and price:
                     items[desc] = price
-    return items
+                    continue
+
+        # Fallback regex for standard text line structures
+        match = re.search(r"(.+?)\s+(\d+[\.,]\d{2})\s*$", cleaned_line)
+        if match:
+            desc = match.group(1).strip()
+            price = clean_price_string(match.group(2))
+            if desc and price and len(desc) > 3:
+                items[desc] = price
+
+    return column_header, items
 
 if uploaded_files:
     st.info(f"📂 {len(uploaded_files)} files staged for processing.")
@@ -80,14 +101,15 @@ if uploaded_files:
         for file in uploaded_files:
             try:
                 bytes_data = file.read()
-                inv_name = file.name.split('.')[0]
-                col_header = f"{inv_name} (Rate)"
                 
+                # Extract text reliably from either PDF or text files
                 if file.name.lower().endswith('.pdf'):
-                    file_items = parse_pdf_tables(bytes_data)
+                    with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
+                        string_data = "\n".join([page.extract_text() or "" for page in pdf.pages])
                 else:
                     string_data = bytes_data.decode("utf-8", errors="ignore")
-                    file_items = parse_text_lines(string_data)
+                
+                col_header, file_items = parse_invoice_content(string_data, file.name)
                 
                 if file_items:
                     if col_header not in all_invoice_columns:
@@ -101,7 +123,7 @@ if uploaded_files:
                 st.error(f"Error parsing file {file.name}: {str(e)}")
                 continue
         
-        # Build side-by-side rows
+        # Format the matrix data into clean row-by-row outputs
         matrix_records = []
         for item_desc, tracking_cols in master_matrix.items():
             record = {"Item Description": item_desc}
@@ -124,11 +146,11 @@ if uploaded_files:
                     return "Stable"
                 final_df["Price Shift Audit"] = final_df.apply(calculate_change, axis=1)
             else:
-                final_df["Price Shift Audit"] = "Upload more invoices to compare."
+                final_df["Price Shift Audit"] = "Upload more invoices to compare historical tracking."
 
             st.session_state["comparison_matrix"] = final_df
         else:
-            st.error("No valid tabular material descriptions or unit prices could be detected.")
+            st.error("No valid material lines or unit price structures could be parsed. Check text layouts.")
 
 if "comparison_matrix" in st.session_state:
     df_to_show = st.session_state["comparison_matrix"]
