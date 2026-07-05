@@ -15,21 +15,10 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-def clean_price_string(price_str):
-    cleaned = re.sub(r"[^\d.]", "", price_str.strip())
-    try:
-        val = float(cleaned)
-        if 0.01 <= val <= 100000.00:
-            return val
-    except ValueError:
-        pass
-    return None
-
 def parse_invoice_content(text_content, filename):
     """
-    Parses structural pipes to perfectly isolate Catalog Number, 
-    Item Description, and Unit Price while completely stripping out 
-    quantities, vendor codes, and totals.
+    Normalizes and splits lines into predictable tokens.
+    Extracts Catalog Number, Description, and Unit Price completely layout-free.
     """
     items = {}
     lines = text_content.split('\n')
@@ -37,15 +26,15 @@ def parse_invoice_content(text_content, filename):
     inv_name = filename.split('.')[0]
     column_header = f"{inv_name} (Rate)"
     
-    # Common vendor classification codes to explicitly drop
-    vendor_codes = {"PVC", "PVF", "BRI", "CON", "ALF"}
+    # Standard vendor codes to automatically drop from the catalog field
+    vendor_codes = {"PVC", "PVF", "BRI", "CON", "ALF", "LIT"}
     
     for line in lines:
         cleaned_line = line.strip()
         if not cleaned_line:
             continue
             
-        # Ignore structural invoice layout noise, headers, and totals
+        # Ignore invoice metadata, locations, and totals
         if any(x in cleaned_line.lower() for x in [
             "sub total:", "total:", "tax:", "remit to:", "ship to:", "sold to:", 
             "visa credit:", "coppell", "waco", "farmers branch", "ticket #", 
@@ -55,41 +44,53 @@ def parse_invoice_content(text_content, filename):
         ]):
             continue
 
-        # Process structural pipe-separated lines
-        if '|' in cleaned_line:
-            parts = [p.strip() for p in cleaned_line.split('|')]
+        # 1. Normalize line layout by replacing pipes with spaces and stripping dollar signs
+        normalized = cleaned_line.replace('|', ' ').replace('$', ' ')
+        tokens = [t.strip() for t in normalized.split() if t.strip()]
+        
+        # A valid item line must have an item#, qty, backorder, catalog, vendor code, description, and price
+        if len(tokens) >= 6:
+            # Find all decimal prices in the tokens list
+            decimal_indices = [i for i, t in enumerate(tokens) if re.match(r"^\d{1,5}\.\d{2}$", t)]
             
-            if len(parts) >= 6:
+            if decimal_indices:
+                # The first decimal match is always our Unit Price
+                unit_price_idx = decimal_indices[0]
+                try:
+                    unit_price = float(tokens[unit_price_idx])
+                except ValueError:
+                    continue
+                
+                # Look backwards from the unit price to identify structural segments
+                # Positions relative to standard invoice token sequences:
+                # tokens[0]=Item#, tokens[1]=Qty, tokens[2]=BO, tokens[3]=Catalog#, tokens[4]=VendorCode
+                
                 catalog_num = ""
-                description = ""
-                unit_price = None
-                
-                # 1. Isolate Catalog Number (Filter out vendor codes and raw digit rows)
-                for part in parts[2:5]:
-                    if part and not re.search(r"^\d+$", part) and part not in vendor_codes:
-                        # Clean off any text prefixes or trailing numbers if glued together by text reader
-                        cleaned_part = re.sub(r"^\d+\s*", "", part).split()[0]
-                        if cleaned_part not in vendor_codes:
-                            catalog_num = cleaned_part
-                            break
-                
-                # 2. Isolate Description
-                for part in parts:
-                    if any(k in part.upper() for k in ["CONDUIT", "ELBOW", "COUPLING", "STRAP", "CAP", "BOX", "WIRE"]):
-                        description = part.strip()
+                # Determine catalog number position safely near the beginning of the tokens list
+                for idx in [3, 2, 4]:
+                    if idx < len(tokens) and tokens[idx] not in vendor_codes and not re.match(r"^\d+$", tokens[idx]):
+                        catalog_num = tokens[idx]
                         break
                 
-                # 3. Isolate Unit Price (Avoid capturing the final Extended Price column)
-                for part in parts[4:-1]:
-                    matches = re.findall(r"\d{1,5}\.\d{2}", part)
-                    if matches:
-                        test_price = clean_price_string(matches[0])
-                        if test_price:
-                            unit_price = test_price
-                            break
+                # Fallback if catalog number is glued directly to the backorder 0 (e.g. "0PVC1")
+                if not catalog_num and len(tokens) > 2:
+                    for idx in [2, 3]:
+                        if idx < len(tokens):
+                            m = re.match(r"^\d+([A-Za-z0-9\-]+)$", tokens[idx])
+                            if m and m.group(1) not in vendor_codes:
+                                catalog_num = m.group(1)
+                                break
                 
-                # Commit if valid product structural data exists
-                if catalog_num and description and unit_price is not None:
+                # Isolate the remaining tokens between the vendor code and the unit price as the item description
+                desc_tokens = []
+                for t in tokens[3:unit_price_idx]:
+                    if t not in vendor_codes and t != catalog_num and not re.match(r"^\d+$", t):
+                        desc_tokens.append(t)
+                
+                description = " ".join(desc_tokens).strip()
+                
+                # Commit item row data if we have a valid catalog number and description
+                if catalog_num and description:
                     items[(catalog_num, description)] = unit_price
 
     return column_header, items
@@ -133,7 +134,7 @@ if uploaded_files:
                 "Item Description": item_desc
             }
             for col in all_invoice_columns:
-                # Forces 0.00 as a clean default if the item is missing on this specific document
+                # Add 0.00 fallback if item is missing on specific invoice columns
                 record[col] = tracking_cols.get(col, 0.00)
             matrix_records.append(record)
             
@@ -141,7 +142,7 @@ if uploaded_files:
             final_df = pd.DataFrame(matrix_records)
             final_df[all_invoice_columns] = final_df[all_invoice_columns].fillna(0.00)
             
-            # Dynamic price tracking
+            # Audit changes across items
             if len(all_invoice_columns) >= 2:
                 def calculate_change(row):
                     valid_prices = [row[col] for col in all_invoice_columns if row[col] > 0.00]
